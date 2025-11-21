@@ -634,6 +634,9 @@ function initPreviewMap(domElId, preview, previewSettings) {
             if (html)
                 popup.show(evt.mapBrowserEvent.coordinate, html);
         });
+        
+        // Сохраняем карту в глобальной переменной для доступа извне
+        window.currentMap = map;
     }).catch(e => {
         loadingDone();
     });

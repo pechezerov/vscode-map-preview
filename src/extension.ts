@@ -235,50 +235,190 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                     mapEl.innerHTML = errHtml;
                 }
 
-                try {
-                    var previewProj = ${projection ? ('"' + projection + '"') : "null"};
-                    var previewConfig = ${JSON.stringify(config)};
-                    previewConfig.sourceProjection = previewProj;
-                    var docUri = "${this._wctx.asWebviewUri(doc.uri)}";
-                    fetch(docUri).then(r => {
-                        r.text().then(content => {
-                            var formatOptions = { featureProjection: 'EPSG:3857' };
-                            if (previewProj != null) {
-                                formatOptions.dataProjection = previewProj; 
-                            }
-                            createPreviewSource(content, formatOptions, previewConfig, function (preview) {
-                                document.getElementById("format").innerHTML = "Format: " + preview.driver;
-                                initPreviewMap('map', preview, previewConfig);
-                            });
-                        }).catch(e => setError(e));
-                    }).catch(e => setError(e));                    
-                } catch (e) {
-                    setError(e);
+                var currentMap = null;
+                var currentPreviewConfig = null;
+                var currentFormatOptions = null;
+                var currentDocUri = "${this._wctx.asWebviewUri(doc.uri)}";
+                var currentPreviewProj = ${projection ? ('"' + projection + '"') : "null"};
+
+                function loadPreview() {
+                    try {
+                        var previewConfig = ${JSON.stringify(config)};
+                        previewConfig.sourceProjection = currentPreviewProj;
+                        currentPreviewConfig = previewConfig;
+                        
+                        var formatOptions = { featureProjection: 'EPSG:3857' };
+                        if (currentPreviewProj != null) {
+                            formatOptions.dataProjection = currentPreviewProj; 
+                        }
+                        currentFormatOptions = formatOptions;
+                        
+                        // Добавляем timestamp для предотвращения кэширования
+                        var uriWithCacheBuster = currentDocUri + (currentDocUri.indexOf('?') === -1 ? '?' : '&') + '_t=' + Date.now();
+                        fetch(uriWithCacheBuster, { cache: 'no-cache' }).then(r => {
+                            r.text().then(content => {
+                                createPreviewSource(content, formatOptions, previewConfig, function (preview) {
+                                    document.getElementById("format").innerHTML = "Format: " + preview.driver;
+                                    
+                                    // Если карта уже существует, обновляем её
+                                    if (window.currentMap) {
+                                        currentMap = window.currentMap;
+                                        // Находим слой предпросмотра
+                                        var layers = currentMap.getLayers();
+                                        var previewLayerGroup = null;
+                                        for (var i = 0; i < layers.getLength(); i++) {
+                                            var layer = layers.item(i);
+                                            if (layer.get('title') === 'Map Preview') {
+                                                previewLayerGroup = layer;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if (previewLayerGroup) {
+                                            var previewLayer = previewLayerGroup.getLayers().item(0);
+                                            if (previewLayer) {
+                                                // Получаем старый источник
+                                                var oldSource = previewLayer.getSource();
+                                                
+                                                // Очищаем старые features из старого источника
+                                                if (oldSource) {
+                                                    oldSource.clear(true);
+                                                }
+                                                
+                                                // Устанавливаем новый источник данных
+                                                previewLayer.setSource(preview.source);
+                                                
+                                                // Функция для обновления карты после загрузки данных
+                                                var updateMapExtent = function() {
+                                                    try {
+                                                        var features = preview.source.getFeatures();
+                                                        if (features && features.length > 0) {
+                                                            // Обновляем экстент карты
+                                                            var view = currentMap.getView();
+                                                            var extent = preview.source.getExtent();
+                                                            if (extent && extent.length === 4 && 
+                                                                !isNaN(extent[0]) && !isNaN(extent[1]) && 
+                                                                !isNaN(extent[2]) && !isNaN(extent[3])) {
+                                                                // Сохраняем текущий зум, если он был установлен пользователем
+                                                                var currentZoom = view.getZoom();
+                                                                view.fit(extent, {
+                                                                    size: currentMap.getSize(),
+                                                                    padding: [50, 50, 50, 50],
+                                                                    duration: 500,
+                                                                    maxZoom: currentZoom && currentZoom > 10 ? currentZoom : undefined
+                                                                });
+                                                            }
+                                                        }
+                                                        
+                                                        // Принудительно обновляем карту
+                                                        currentMap.updateSize();
+                                                        currentMap.render();
+                                                    } catch (e) {
+                                                        console.error('Error updating map:', e);
+                                                    }
+                                                };
+                                                
+                                                // Проверяем, загружены ли features
+                                                var checkAndUpdate = function() {
+                                                    var features = preview.source.getFeatures();
+                                                    if (features && features.length > 0) {
+                                                        updateMapExtent();
+                                                    } else {
+                                                        // Ждем загрузки features
+                                                        setTimeout(checkAndUpdate, 50);
+                                                    }
+                                                };
+                                                
+                                                // Начинаем проверку
+                                                setTimeout(checkAndUpdate, 100);
+                                            }
+                                        }
+                                    } else {
+                                        // Создаём новую карту
+                                        initPreviewMap('map', preview, previewConfig);
+                                        // Сохраняем ссылку на карту после инициализации
+                                        setTimeout(function() {
+                                            if (window.currentMap) {
+                                                currentMap = window.currentMap;
+                                            }
+                                        }, 100);
+                                    }
+                                });
+                            }).catch(e => setError(e));
+                        }).catch(e => setError(e));                    
+                    } catch (e) {
+                        setError(e);
+                    }
                 }
+
+                // Получаем VS Code API
+                const vscode = acquireVsCodeApi();
+                
+                // Обработчик сообщений от расширения
+                window.addEventListener('message', event => {
+                    const message = event.data;
+                    if (message && message.command) {
+                        switch (message.command) {
+                            case 'updatePreview':
+                                // Обновляем предпросмотр
+                                console.log('Received updatePreview command');
+                                loadPreview();
+                                break;
+                        }
+                    }
+                });
+
+                // Уведомляем расширение, что webview готов
+                vscode.postMessage({ command: 'ready' });
+
+                // Загружаем предпросмотр при инициализации
+                loadPreview();
             </script>
         </body>`;
     }
 }
 
-function loadWebView(content: PreviewDocumentContentProvider, previewUri: vscode.Uri, fileName: string, extensionPath: string) {
+// Map для отслеживания открытых панелей предпросмотра: docUri -> panel
+const previewPanels = new Map<string, vscode.WebviewPanel>();
+
+function loadWebView(content: PreviewDocumentContentProvider, previewUri: vscode.Uri, fileName: string, extensionPath: string, doc: vscode.TextDocument, subscriptions: vscode.Disposable[]) {
     //const column = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : undefined;
     const docName = path.basename(fileName);
     const docDir = path.dirname(fileName);
-    const panel = vscode.window.createWebviewPanel(
-        WEBVIEW_TYPE,
-        `Map Preview: ${docName}`,
-        vscode.ViewColumn.Two,
-        {
-            // Enable scripts in the webview
-            enableScripts: true,
-            // Restrict the webview to only loading content from our extension's `static` directory.
-            localResourceRoots: [
-                vscode.Uri.file(path.join(extensionPath, 'static')),
-                // IMPORTANT: Otherwise our generated HTML cannot fetch() this document's content
-                vscode.Uri.file(docDir)
-            ]
-        }
-    );
+    
+    // Проверяем, есть ли уже открытая панель для этого документа
+    const docUriString = doc.uri.toString();
+    let panel = previewPanels.get(docUriString);
+    
+    if (panel) {
+        // Если панель уже существует, просто показываем её
+        panel.reveal(vscode.ViewColumn.Two);
+    } else {
+        // Создаём новую панель
+        panel = vscode.window.createWebviewPanel(
+            WEBVIEW_TYPE,
+            `Map Preview: ${docName}`,
+            vscode.ViewColumn.Two,
+            {
+                // Enable scripts in the webview
+                enableScripts: true,
+                // Restrict the webview to only loading content from our extension's `static` directory.
+                localResourceRoots: [
+                    vscode.Uri.file(path.join(extensionPath, 'static')),
+                    // IMPORTANT: Otherwise our generated HTML cannot fetch() this document's content
+                    vscode.Uri.file(docDir)
+                ]
+            }
+        );
+        
+        // Удаляем панель из Map при закрытии
+        panel.onDidDispose(() => {
+            previewPanels.delete(docUriString);
+        });
+        
+        previewPanels.set(docUriString, panel);
+    }
+    
     const scriptNonce = getNonce();
     const cssNonce = getNonce();
     const wctx: IWebViewContext = {
@@ -291,6 +431,19 @@ function loadWebView(content: PreviewDocumentContentProvider, previewUri: vscode
     const html = content.provideTextDocumentContent(previewUri);
     content.detachWebViewContext();
     panel.webview.html = html;
+    
+    // Обработчик сообщений от webview
+    panel.webview.onDidReceiveMessage(
+        message => {
+            switch (message.command) {
+                case 'ready':
+                    // Webview готов, можно отправлять обновления
+                    break;
+            }
+        },
+        undefined,
+        subscriptions
+    );
 }
 
 function getNonce() {
@@ -327,7 +480,7 @@ export function activate(context: vscode.ExtensionContext) {
         const previewUri = makePreviewUri(doc);
         provider.clearPreviewProjection(previewUri);
         provider.triggerVirtualDocumentChange(previewUri);
-        loadWebView(provider, previewUri, doc.fileName, extensionPath);
+        loadWebView(provider, previewUri, doc.fileName, extensionPath, doc, context.subscriptions);
     });
 
     const previewWithProjCommand = vscode.commands.registerCommand(PREVIEW_PROJ_COMMAND_ID, () => {
@@ -363,12 +516,38 @@ export function activate(context: vscode.ExtensionContext) {
                 const previewUri = makePreviewUri(doc);
                 provider.setPreviewProjection(previewUri, val.projection);
                 provider.triggerVirtualDocumentChange(previewUri);
-                loadWebView(provider, previewUri, doc.fileName, extensionPath);
+                loadWebView(provider, previewUri, doc.fileName, extensionPath, doc, context.subscriptions);
             }
         });
     });
 
-    context.subscriptions.push(previewCommand, registration);
+    // Подписка на изменения документов для live preview
+    const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
+        // Игнорируем изменения в негеопространственных файлах
+        const fileName = e.document.fileName.toLowerCase();
+        const supportedExtensions = ['.geojson', '.json', '.kml', '.csv', '.gpx', '.igc', '.gml'];
+        const isSupported = supportedExtensions.some(ext => fileName.endsWith(ext));
+        
+        if (!isSupported) {
+            return;
+        }
+        
+        const docUriString = e.document.uri.toString();
+        const panel = previewPanels.get(docUriString);
+        
+        if (panel) {
+            // Обновляем виртуальный документ
+            const previewUri = makePreviewUri(e.document);
+            provider.triggerVirtualDocumentChange(previewUri);
+            
+            // Отправляем сообщение в webview для обновления данных
+            panel.webview.postMessage({
+                command: 'updatePreview'
+            });
+        }
+    });
+
+    context.subscriptions.push(previewCommand, previewWithProjCommand, registration, changeDocumentSubscription);
 }
 
 // this method is called when your extension is deactivated
