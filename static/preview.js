@@ -118,6 +118,40 @@ function tryReadFeatures(format, text, options) {
     }
 }
 
+function normalizeGeoJSON(content) {
+    try {
+        const parsed = JSON.parse(content);
+        // Check if it's an array of feature-like objects
+        if (Array.isArray(parsed) && parsed.length > 0) {
+            // Check if first element looks like a Feature (has geometry property)
+            const firstItem = parsed[0];
+            if (firstItem && typeof firstItem === 'object' && firstItem.geometry) {
+                // Ensure each feature has type: "Feature" and normalize structure
+                const normalizedFeatures = parsed.map(item => {
+                    if (item.type !== 'Feature') {
+                        return {
+                            type: 'Feature',
+                            geometry: item.geometry,
+                            properties: item.properties || {}
+                        };
+                    }
+                    return item;
+                });
+                // Wrap array in FeatureCollection
+                return JSON.stringify({
+                    type: 'FeatureCollection',
+                    features: normalizedFeatures
+                });
+            }
+        }
+        // Return original content if not an array of features
+        return content;
+    } catch (e) {
+        // If JSON parsing fails, return original content
+        return content;
+    }
+}
+
 function createPreviewSource(previewContent, formatOptions, previewSettings, callback) {
     let projections = previewSettings.projections || [];
     if (projections.length > 0) {
@@ -152,7 +186,12 @@ function createPreviewSource(previewContent, formatOptions, previewSettings, cal
             for (let formatName in formats) {
                 let format = formats[formatName];
                 let driver = new format();
-                features = tryReadFeatures(driver, previewContent, formatOptions);
+                // Normalize GeoJSON if it's an array of features
+                let contentToParse = previewContent;
+                if (formatName === "GeoJSON") {
+                    contentToParse = normalizeGeoJSON(previewContent);
+                }
+                features = tryReadFeatures(driver, contentToParse, formatOptions);
                 if (features && features.length > 0) {
                     driverName = formatName;
                     break;
