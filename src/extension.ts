@@ -135,9 +135,9 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                 img-src ${this._wctx.getCspSource()} data: https:;
                 worker-src ${this._wctx.getCspSource()} blob:;
                 connect-src ${this._wctx.getCspSource()} https://dev.virtualearth.net ${cspAllowedUrls.join(" ")};
+                script-src 'nonce-${this._wctx.getScriptNonce()}' 'unsafe-eval' ${this._wctx.getCspSource()};
                 style-src 'unsafe-inline' ${this._wctx.getCspSource()};
-                style-src-elem 'unsafe-inline' ${this._wctx.getCspSource()};
-                script-src 'nonce-${this._wctx.getScriptNonce()}' ${this._wctx.getCspSource()};" />
+                style-src-elem 'unsafe-inline' ${this._wctx.getCspSource()};" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Map Preview</title>
     </head>
@@ -210,6 +210,7 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
         return `<body>
             <div id="map" style="width: 100%; height: 100%">
                 <div id="format" style="position: absolute; left: 40; top: 5; z-index: 100; padding: 5px; background: yellow; color: black"></div>
+                <div id="geometry-info" style="position: absolute; right: 10px; top: 10px; width: 350px; max-height: 80%; overflow-y: auto; z-index: 1000; background: rgba(255, 255, 255, 0.95); border: 1px solid #ccc; border-radius: 4px; padding: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); font-size: 12px;"></div>
             </div>
             <div id="loading-mask" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0">
                 <div>Loading Preview ...</div>
@@ -223,6 +224,7 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
             this.createLocalSource("ol.js", SourceType.SCRIPT) +
             this.createLocalSource("ol-layerswitcher.js", SourceType.SCRIPT) +
             this.createLocalSource("ol-popup.js", SourceType.SCRIPT) +
+            this.createLocalSource("turf.min.js", SourceType.SCRIPT) +
             this.createLocalSource("preview.js", SourceType.SCRIPT) +
             this.createLocalSource("preview.css", SourceType.STYLE) +
             `<script nonce="${this._wctx.getScriptNonce()}" type="text/javascript">
@@ -259,6 +261,13 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                             r.text().then(content => {
                                 createPreviewSource(content, formatOptions, previewConfig, function (preview) {
                                     document.getElementById("format").innerHTML = "Format: " + preview.driver;
+                                    
+                                    // Обновляем информацию о геометриях после загрузки всех скриптов
+                                    setTimeout(function() {
+                                        if (typeof updateGeometryInfo === 'function') {
+                                            updateGeometryInfo(preview.source);
+                                        }
+                                    }, 500);
                                     
                                     // Если карта уже существует, обновляем её
                                     if (window.currentMap) {
@@ -331,6 +340,13 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                                                 
                                                 // Начинаем проверку
                                                 setTimeout(checkAndUpdate, 100);
+                                                
+                                                // Обновляем информацию о геометриях после обновления карты
+                                                setTimeout(function() {
+                                                    if (typeof updateGeometryInfo === 'function') {
+                                                        updateGeometryInfo(preview.source);
+                                                    }
+                                                }, 200);
                                             }
                                         }
                                     } else {

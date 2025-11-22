@@ -494,6 +494,345 @@ function loadingDone() {
     el.remove();
 }
 
+// Функция для конвертации OpenLayers геометрии в GeoJSON
+function olGeometryToGeoJSON(geom) {
+    const format = new ol.format.GeoJSON();
+    return format.writeGeometryObject(geom);
+}
+
+// Функция для проверки валидности геометрии через turf.js v7.3
+function isValidGeometry(geomGeoJSON) {
+    try {
+        // Проверяем разные варианты доступа к turf.js
+        let turfLib = null;
+        if (typeof turf !== 'undefined') {
+            turfLib = turf;
+        } else if (typeof window !== 'undefined' && window.turf) {
+            turfLib = window.turf;
+        } else if (typeof self !== 'undefined' && self.turf) {
+            turfLib = self.turf;
+        }
+        
+        if (!turfLib) {
+            return null; // turf не загружен
+        }
+        
+        // В turf.js v7.3 функция booleanValid должна быть доступна
+        let booleanValidFunc = null;
+        
+        // Вариант 1: turf.booleanValid
+        if (turfLib.booleanValid && typeof turfLib.booleanValid === 'function') {
+            booleanValidFunc = turfLib.booleanValid;
+        }
+        // Вариант 2: через default экспорт
+        else if (turfLib.default && turfLib.default.booleanValid && typeof turfLib.default.booleanValid === 'function') {
+            booleanValidFunc = turfLib.default.booleanValid;
+        }
+        
+        if (booleanValidFunc) {
+            try {
+                // Преобразуем геометрию в Feature для turf.js
+                let featureToValidate = geomGeoJSON;
+                if (geomGeoJSON.type === 'Geometry') {
+                    featureToValidate = {
+                        type: 'Feature',
+                        geometry: geomGeoJSON,
+                        properties: {}
+                    };
+                }
+                return booleanValidFunc(featureToValidate);
+            } catch (e) {
+                console.error('Error calling turf.booleanValid:', e);
+                return false;
+            }
+        }
+        
+        // Если функция не найдена, используем OpenLayers как fallback
+        try {
+            const format = new ol.format.GeoJSON();
+            const olGeom = format.readGeometry(geomGeoJSON);
+            const geomType = olGeom.getType();
+            
+            // Дополнительная проверка для полигонов
+            if (geomType === 'Polygon' || geomType === 'MultiPolygon') {
+                const coords = olGeom.getCoordinates();
+                if (!coords || coords.length === 0) {
+                    return false;
+                }
+                if (geomType === 'Polygon' && coords[0] && coords[0].length < 4) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (olError) {
+            return false;
+        }
+    } catch (e) {
+        console.error('Error validating geometry:', e);
+        return false;
+    }
+}
+
+// Рекурсивный анализ геометрии
+function analyzeGeometry(geom, index = 0, parentType = null) {
+    const geomType = geom.getType();
+    const geomGeoJSON = olGeometryToGeoJSON(geom);
+    const isValid = isValidGeometry(geomGeoJSON);
+    
+    let result = {
+        index: index,
+        type: geomType,
+        parentType: parentType,
+        isValid: isValid,
+        details: {}
+    };
+    
+    switch (geomType) {
+        case 'Point':
+            result.details = {
+                points: 1
+            };
+            break;
+            
+        case 'MultiPoint':
+            const mpCoords = geom.getCoordinates();
+            result.details = {
+                points: mpCoords.length
+            };
+            // Рекурсивно анализируем каждую точку
+            result.children = [];
+            for (let i = 0; i < mpCoords.length; i++) {
+                const pt = new ol.geom.Point(mpCoords[i]);
+                result.children.push(analyzeGeometry(pt, i, geomType));
+            }
+            break;
+            
+        case 'LineString':
+            const lsCoords = geom.getCoordinates();
+            result.details = {
+                points: lsCoords.length
+            };
+            break;
+            
+        case 'MultiLineString':
+            const mlsCoords = geom.getCoordinates();
+            let totalPoints = 0;
+            result.children = [];
+            for (let i = 0; i < mlsCoords.length; i++) {
+                const line = new ol.geom.LineString(mlsCoords[i]);
+                const lineAnalysis = analyzeGeometry(line, i, geomType);
+                result.children.push(lineAnalysis);
+                totalPoints += lineAnalysis.details.points;
+            }
+            result.details = {
+                lines: mlsCoords.length,
+                points: totalPoints
+            };
+            break;
+            
+        case 'Polygon':
+            const polyCoords = geom.getCoordinates();
+            let polyTotalPoints = 0;
+            result.children = [];
+            for (let i = 0; i < polyCoords.length; i++) {
+                const ring = polyCoords[i];
+                polyTotalPoints += ring.length;
+                
+                // Проверяем валидность контура
+                // Создаем LineString из контура для проверки
+                let ringIsValid = null;
+                try {
+                    const ringLineString = new ol.geom.LineString(ring);
+                    const ringGeoJSON = olGeometryToGeoJSON(ringLineString);
+                    ringIsValid = isValidGeometry(ringGeoJSON);
+                    
+                    // Дополнительная проверка: контур должен быть замкнут (первая и последняя точки совпадают)
+                    if (ring.length >= 4) {
+                        const first = ring[0];
+                        const last = ring[ring.length - 1];
+                        if (first[0] !== last[0] || first[1] !== last[1]) {
+                            ringIsValid = false;
+                        }
+                    } else {
+                        ringIsValid = false; // Контур должен иметь минимум 4 точки
+                    }
+                } catch (e) {
+                    ringIsValid = false;
+                }
+                
+                result.children.push({
+                    index: i,
+                    type: i === 0 ? 'Exterior Ring' : 'Interior Ring',
+                    parentType: geomType,
+                    isValid: ringIsValid,
+                    details: {
+                        points: ring.length
+                    }
+                });
+            }
+            result.details = {
+                rings: polyCoords.length,
+                points: polyTotalPoints
+            };
+            break;
+            
+        case 'MultiPolygon':
+            const mpolyCoords = geom.getCoordinates();
+            let mpolyTotalPoints = 0;
+            let mpolyTotalRings = 0;
+            result.children = [];
+            for (let i = 0; i < mpolyCoords.length; i++) {
+                const polygon = new ol.geom.Polygon(mpolyCoords[i]);
+                const polyAnalysis = analyzeGeometry(polygon, i, geomType);
+                result.children.push(polyAnalysis);
+                mpolyTotalPoints += polyAnalysis.details.points;
+                mpolyTotalRings += polyAnalysis.details.rings;
+            }
+            result.details = {
+                polygons: mpolyCoords.length,
+                rings: mpolyTotalRings,
+                points: mpolyTotalPoints
+            };
+            break;
+            
+        case 'GeometryCollection':
+            const gcGeoms = geom.getGeometries();
+            result.children = [];
+            for (let i = 0; i < gcGeoms.length; i++) {
+                result.children.push(analyzeGeometry(gcGeoms[i], i, geomType));
+            }
+            result.details = {
+                geometries: gcGeoms.length
+            };
+            break;
+    }
+    
+    return result;
+}
+
+// Функция для отображения информации о геометриях
+function renderGeometryInfo(analyses) {
+    let html = '<div class="geometry-info-header">Информация о геометриях</div>';
+    html += '<div class="geometry-info-content">';
+    
+    if (analyses.length === 0) {
+        html += '<div class="geometry-item">Геометрии не найдены</div>';
+    } else {
+        analyses.forEach((analysis, idx) => {
+            html += renderGeometryItem(analysis, idx, 0);
+        });
+    }
+    
+    html += '</div>';
+    return html;
+}
+
+// Рекурсивная функция для отображения элемента геометрии
+function renderGeometryItem(analysis, idx, level) {
+    const indent = level * 20;
+    const marginLeft = indent + 'px';
+    
+    let html = `<div class="geometry-item" style="margin-left: ${marginLeft}">`;
+    
+    // Тип геометрии
+    let typeLabel = analysis.type;
+    if (analysis.parentType) {
+        typeLabel += ` (в ${analysis.parentType})`;
+    }
+    html += `<div class="geometry-type"><strong>${typeLabel}</strong></div>`;
+    
+    // Детали
+    html += '<div class="geometry-details">';
+    if (analysis.details) {
+        let hasDetails = false;
+        if (analysis.details.points !== undefined) {
+            html += `<span class="detail-item">Точек: ${analysis.details.points}</span>`;
+            hasDetails = true;
+        }
+        if (analysis.details.lines !== undefined) {
+            html += `<span class="detail-item">Линий: ${analysis.details.lines}</span>`;
+            hasDetails = true;
+        }
+        if (analysis.details.rings !== undefined) {
+            html += `<span class="detail-item">Контуров: ${analysis.details.rings}</span>`;
+            hasDetails = true;
+        }
+        if (analysis.details.polygons !== undefined) {
+            html += `<span class="detail-item">Полигонов: ${analysis.details.polygons}</span>`;
+            hasDetails = true;
+        }
+        if (analysis.details.geometries !== undefined) {
+            html += `<span class="detail-item">Геометрий: ${analysis.details.geometries}</span>`;
+            hasDetails = true;
+        }
+        if (!hasDetails) {
+            html += '<span class="detail-item">Нет деталей</span>';
+        }
+    } else {
+        html += '<span class="detail-item">Детали недоступны</span>';
+    }
+    html += '</div>';
+    
+    // Валидность
+    html += '<div class="geometry-validity">';
+    if (analysis.isValid === null) {
+        html += '<span class="validity-unknown">Валидность: не проверена (turf.js не загружен)</span>';
+    } else if (analysis.isValid) {
+        html += '<span class="validity-valid">✓ Валидна</span>';
+    } else {
+        html += '<span class="validity-invalid">✗ Невалидна</span>';
+    }
+    html += '</div>';
+    
+    html += '</div>';
+    
+    // Рекурсивно отображаем дочерние элементы
+    if (analysis.children && analysis.children.length > 0) {
+        analysis.children.forEach((child, childIdx) => {
+            html += renderGeometryItem(child, childIdx, level + 1);
+        });
+    }
+    
+    return html;
+}
+
+// Функция для проверки доступности turf.js
+function checkTurfAvailability() {
+    const checks = {
+        'typeof turf': typeof turf,
+        'window.turf': typeof window !== 'undefined' ? typeof window.turf : 'N/A',
+        'turf.booleanValid': typeof turf !== 'undefined' && typeof turf.booleanValid,
+        'turf.default': typeof turf !== 'undefined' && turf.default ? typeof turf.default : 'N/A',
+        'turf.valid': typeof turf !== 'undefined' && typeof turf.valid
+    };
+    console.log('Turf.js availability check:', checks);
+    return checks;
+}
+
+// Функция для анализа всех features и обновления панели информации
+function updateGeometryInfo(source) {
+    const features = source.getFeatures();
+    const analyses = [];
+    
+    // Проверяем доступность turf.js при первом вызове
+    if (typeof window.turfChecked === 'undefined') {
+        checkTurfAvailability();
+        window.turfChecked = true;
+    }
+    
+    features.forEach((feature, idx) => {
+        const geom = feature.getGeometry();
+        if (geom) {
+            analyses.push(analyzeGeometry(geom, idx));
+        }
+    });
+    
+    const infoDiv = document.getElementById('geometry-info');
+    if (infoDiv) {
+        infoDiv.innerHTML = renderGeometryInfo(analyses);
+    }
+}
+
 function initPreviewMap(domElId, preview, previewSettings) {
     let vertexStyle = null;
     if (previewSettings.style.vertex.enabled === true) {
@@ -634,6 +973,13 @@ function initPreviewMap(domElId, preview, previewSettings) {
             if (html)
                 popup.show(evt.mapBrowserEvent.coordinate, html);
         });
+        
+        // Обновляем информацию о геометриях после инициализации карты
+        setTimeout(function() {
+            if (typeof updateGeometryInfo === 'function') {
+                updateGeometryInfo(preview.source);
+            }
+        }, 200);
         
         // Сохраняем карту в глобальной переменной для доступа извне
         window.currentMap = map;
