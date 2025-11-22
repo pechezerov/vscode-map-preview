@@ -584,7 +584,8 @@ function analyzeGeometry(geom, index = 0, parentType = null) {
         type: geomType,
         parentType: parentType,
         isValid: isValid,
-        details: {}
+        details: {},
+        geometry: geom // Сохраняем ссылку на саму геометрию
     };
     
     switch (geomType) {
@@ -603,7 +604,8 @@ function analyzeGeometry(geom, index = 0, parentType = null) {
             result.children = [];
             for (let i = 0; i < mpCoords.length; i++) {
                 const pt = new ol.geom.Point(mpCoords[i]);
-                result.children.push(analyzeGeometry(pt, i, geomType));
+                const ptAnalysis = analyzeGeometry(pt, i, geomType);
+                result.children.push(ptAnalysis);
             }
             break;
             
@@ -660,6 +662,9 @@ function analyzeGeometry(geom, index = 0, parentType = null) {
                     ringIsValid = false;
                 }
                 
+                // Создаем LineString для контура (для подсветки)
+                const ringLineString = new ol.geom.LineString(ring);
+                
                 result.children.push({
                     index: i,
                     type: i === 0 ? 'Exterior Ring' : 'Interior Ring',
@@ -667,7 +672,8 @@ function analyzeGeometry(geom, index = 0, parentType = null) {
                     isValid: ringIsValid,
                     details: {
                         points: ring.length
-                    }
+                    },
+                    geometry: ringLineString // Сохраняем геометрию контура
                 });
             }
             result.details = {
@@ -719,7 +725,7 @@ function renderGeometryInfo(analyses) {
         html += '<div class="geometry-item">Геометрии не найдены</div>';
     } else {
         analyses.forEach((analysis, idx) => {
-            html += renderGeometryItem(analysis, idx, 0);
+            html += renderGeometryItem(analysis, idx, 0, idx, null);
         });
     }
     
@@ -728,11 +734,30 @@ function renderGeometryInfo(analyses) {
 }
 
 // Рекурсивная функция для отображения элемента геометрии
-function renderGeometryItem(analysis, idx, level) {
+function renderGeometryItem(analysis, idx, level, featureIndex = null, childPath = null) {
     const indent = level * 20;
     const marginLeft = indent + 'px';
     
-    let html = `<div class="geometry-item" style="margin-left: ${marginLeft}">`;
+    // Определяем, нужно ли добавлять data-атрибуты для hover-эффекта
+    // Добавляем для корневых элементов и для дочерних элементов мультигеометрий
+    let dataAttr = '';
+    let cursorStyle = '';
+    
+    if (featureIndex !== null) {
+        if (level === 0) {
+            // Корневой элемент - используем только featureIndex
+            dataAttr = `data-feature-index="${featureIndex}"`;
+            cursorStyle = 'cursor: pointer;';
+        } else if (level > 0 && analysis.geometry && childPath !== null) {
+            // Дочерний элемент - используем featureIndex и путь к дочернему элементу
+            // childPath - это массив индексов, указывающий путь к дочернему элементу
+            const pathStr = childPath.join(',');
+            dataAttr = `data-feature-index="${featureIndex}" data-child-path="${pathStr}"`;
+            cursorStyle = 'cursor: pointer;';
+        }
+    }
+    
+    let html = `<div class="geometry-item" style="margin-left: ${marginLeft}; ${cursorStyle}" ${dataAttr}>`;
     
     // Тип геометрии
     let typeLabel = analysis.type;
@@ -789,7 +814,9 @@ function renderGeometryItem(analysis, idx, level) {
     // Рекурсивно отображаем дочерние элементы
     if (analysis.children && analysis.children.length > 0) {
         analysis.children.forEach((child, childIdx) => {
-            html += renderGeometryItem(child, childIdx, level + 1);
+            // Формируем путь к дочернему элементу
+            const newChildPath = childPath === null ? [childIdx] : [...childPath, childIdx];
+            html += renderGeometryItem(child, childIdx, level + 1, featureIndex, newChildPath);
         });
     }
     
@@ -809,10 +836,320 @@ function checkTurfAvailability() {
     return checks;
 }
 
+// Глобальные переменные для хранения связи между элементами меню и features
+window.geometryInfoFeatures = null;
+window.geometryInfoAnalyses = null; // Сохраняем анализы для доступа к дочерним геометриям
+window.geometryInfoHighlightLayer = null;
+
+// Функция для создания слоя подсветки bbox
+function createHighlightLayer(map) {
+    if (window.geometryInfoHighlightLayer) {
+        map.removeLayer(window.geometryInfoHighlightLayer);
+    }
+    
+    const highlightSource = new ol.source.Vector();
+    const highlightLayer = new ol.layer.Vector({
+        source: highlightSource,
+        style: new ol.style.Style({
+            stroke: new ol.style.Stroke({
+                color: '#ff0000',
+                width: 3,
+                lineDash: [5, 5]
+            }),
+            fill: new ol.style.Fill({
+                color: 'rgba(255, 0, 0, 0.1)'
+            })
+        }),
+        zIndex: 1000
+    });
+    
+    map.addLayer(highlightLayer);
+    window.geometryInfoHighlightLayer = highlightLayer;
+    return highlightLayer;
+}
+
+// Функция для получения геометрии по featureIndex и пути к дочернему элементу
+function getGeometryByPath(featureIndex, childPath) {
+    if (!window.geometryInfoAnalyses || !window.geometryInfoFeatures) {
+        return null;
+    }
+    
+    const analyses = window.geometryInfoAnalyses;
+    if (featureIndex < 0 || featureIndex >= analyses.length) {
+        return null;
+    }
+    
+    const analysis = analyses[featureIndex];
+    
+    // Если путь не указан, возвращаем корневую геометрию
+    if (!childPath || childPath.length === 0) {
+        return analysis.geometry;
+    }
+    
+    // Проходим по пути к дочернему элементу
+    let current = analysis;
+    for (let i = 0; i < childPath.length; i++) {
+        const childIndex = childPath[i];
+        if (!current.children || childIndex < 0 || childIndex >= current.children.length) {
+            return null;
+        }
+        current = current.children[childIndex];
+    }
+    
+    // Возвращаем геометрию дочернего элемента
+    return current.geometry || null;
+}
+
+// Функция для вычисления расстояния между двумя координатами в метрах
+function getDistance(coord1, coord2) {
+    try {
+        // Используем ol.sphere если доступен
+        if (typeof ol !== 'undefined' && ol.sphere && ol.sphere.getDistance) {
+            return ol.sphere.getDistance(coord1, coord2);
+        }
+        // Fallback: простое вычисление расстояния по формуле гаверсинуса
+        const R = 6371000; // Радиус Земли в метрах
+        const lat1 = coord1[1] * Math.PI / 180;
+        const lat2 = coord2[1] * Math.PI / 180;
+        const deltaLat = (coord2[1] - coord1[1]) * Math.PI / 180;
+        const deltaLon = (coord2[0] - coord1[0]) * Math.PI / 180;
+        
+        const a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+                   Math.cos(lat1) * Math.cos(lat2) *
+                   Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        
+        return R * c;
+    } catch (e) {
+        // Если вычисление не удалось, возвращаем большое значение
+        return Infinity;
+    }
+}
+
+// Функция для поиска пути к дочернему элементу по координате курсора
+function findChildPathByCoordinate(featureIndex, coordinate) {
+    if (!window.geometryInfoAnalyses || !window.geometryInfoFeatures) {
+        return null;
+    }
+    
+    const analyses = window.geometryInfoAnalyses;
+    if (featureIndex < 0 || featureIndex >= analyses.length) {
+        return null;
+    }
+    
+    const analysis = analyses[featureIndex];
+    const rootGeometry = analysis.geometry;
+    
+    if (!rootGeometry) {
+        return null;
+    }
+    
+    const geomType = rootGeometry.getType();
+    
+    // Для мультигеометрий проверяем каждую дочернюю геометрию
+    if (geomType === 'MultiPolygon' || geomType === 'MultiLineString' || geomType === 'MultiPoint' || geomType === 'GeometryCollection') {
+        // Рекурсивно ищем дочерний элемент, содержащий координату
+        function findPathRecursive(currentAnalysis, coord, currentPath) {
+            if (!currentAnalysis.children || currentAnalysis.children.length === 0) {
+                return null;
+            }
+            
+            let bestMatch = null;
+            let bestDistance = Infinity;
+            
+            for (let i = 0; i < currentAnalysis.children.length; i++) {
+                const child = currentAnalysis.children[i];
+                if (!child.geometry) {
+                    continue;
+                }
+                
+                const childGeom = child.geometry;
+                const childType = childGeom.getType();
+                
+                // Проверяем, содержит ли дочерняя геометрия координату
+                let contains = false;
+                let distance = Infinity;
+                
+                try {
+                    if (childType === 'Polygon') {
+                        contains = childGeom.intersectsCoordinate(coord);
+                        if (contains) {
+                            distance = 0;
+                        }
+                    } else if (childType === 'LineString') {
+                        // Для линий проверяем близость к линии
+                        const closestPoint = childGeom.getClosestPoint(coord);
+                        distance = getDistance(coord, closestPoint);
+                        // Используем порог для определения близости (примерно 50 метров)
+                        contains = distance < 50;
+                    } else if (childType === 'Point') {
+                        const pointCoord = childGeom.getCoordinates();
+                        distance = getDistance(coord, pointCoord);
+                        // Для точек используем меньший порог (примерно 20 метров)
+                        contains = distance < 20;
+                    } else {
+                        // Для других типов используем intersectsCoordinate
+                        contains = childGeom.intersectsCoordinate(coord);
+                        if (contains) {
+                            distance = 0;
+                        }
+                    }
+                } catch (e) {
+                    // Если проверка не удалась, пропускаем
+                    continue;
+                }
+                
+                if (contains && distance < bestDistance) {
+                    bestDistance = distance;
+                    const newPath = [...currentPath, i];
+                    
+                    // Если это не мультигеометрия, сохраняем путь
+                    if (childType !== 'MultiPolygon' && childType !== 'MultiLineString' && childType !== 'MultiPoint' && childType !== 'GeometryCollection') {
+                        bestMatch = newPath;
+                    } else {
+                        // Если это мультигеометрия, продолжаем поиск рекурсивно
+                        const deeperPath = findPathRecursive(child, coord, newPath);
+                        if (deeperPath) {
+                            bestMatch = deeperPath;
+                        } else {
+                            bestMatch = newPath;
+                        }
+                    }
+                }
+            }
+            
+            return bestMatch;
+        }
+        
+        return findPathRecursive(analysis, coordinate, []);
+    }
+    
+    // Для обычных геометрий возвращаем null (нет дочерних элементов)
+    return null;
+}
+
+// Функция для подсветки bbox геометрии
+function highlightGeometryBbox(featureIndex, childPath = null) {
+    if (!window.geometryInfoFeatures || !window.currentMap) {
+        return;
+    }
+    
+    // Получаем геометрию по пути
+    const geometry = getGeometryByPath(featureIndex, childPath);
+    if (!geometry) {
+        return;
+    }
+    
+    // Получаем или создаем слой подсветки
+    let highlightLayer = window.geometryInfoHighlightLayer;
+    if (!highlightLayer) {
+        highlightLayer = createHighlightLayer(window.currentMap);
+    }
+    
+    // Получаем bbox геометрии
+    const extent = geometry.getExtent();
+    if (!extent || extent.length !== 4) {
+        return;
+    }
+    
+    // Создаем полигон из bbox
+    const bboxPolygon = ol.geom.Polygon.fromExtent(extent);
+    const bboxFeature = new ol.Feature({
+        geometry: bboxPolygon
+    });
+    
+    // Очищаем предыдущую подсветку и добавляем новую
+    const highlightSource = highlightLayer.getSource();
+    highlightSource.clear();
+    highlightSource.addFeature(bboxFeature);
+}
+
+// Функция для удаления подсветки
+function clearGeometryHighlight() {
+    if (window.geometryInfoHighlightLayer) {
+        const highlightSource = window.geometryInfoHighlightLayer.getSource();
+        if (highlightSource) {
+            highlightSource.clear();
+        }
+    }
+}
+
+// Флаг для отслеживания, находится ли мышь над меню
+window.isMouseOverMenu = false;
+
+// Функция для установки обработчиков событий на элементы меню
+function setupGeometryInfoEventHandlers() {
+    const infoDiv = document.getElementById('geometry-info');
+    if (!infoDiv) {
+        return;
+    }
+    
+    // Устанавливаем обработчик на весь блок меню
+    infoDiv.addEventListener('mouseenter', function() {
+        window.isMouseOverMenu = true;
+    });
+    
+    infoDiv.addEventListener('mouseleave', function() {
+        window.isMouseOverMenu = false;
+        // Убираем подсветку только если мышь не над картой
+        setTimeout(function() {
+            if (!window.isMouseOverMenu) {
+                clearGeometryHighlight();
+                // Убираем подсветку со всех элементов меню
+                const allItems = infoDiv.querySelectorAll('.geometry-item[data-feature-index]');
+                allItems.forEach(item => {
+                    item.style.background = '#f9f9f9';
+                });
+            }
+        }, 50);
+    });
+    
+    // Удаляем старые обработчики
+    const items = infoDiv.querySelectorAll('.geometry-item[data-feature-index]');
+    items.forEach(item => {
+        // Клонируем элемент для удаления всех обработчиков
+        const newItem = item.cloneNode(true);
+        item.parentNode.replaceChild(newItem, item);
+    });
+    
+    // Добавляем новые обработчики для всех элементов с data-атрибутами
+    const newItems = infoDiv.querySelectorAll('.geometry-item[data-feature-index]');
+    newItems.forEach(item => {
+        const featureIndex = parseInt(item.getAttribute('data-feature-index'));
+        const childPathAttr = item.getAttribute('data-child-path');
+        let childPath = null;
+        
+        // Парсим путь к дочернему элементу, если он есть
+        if (childPathAttr) {
+            childPath = childPathAttr.split(',').map(idx => parseInt(idx));
+        }
+        
+        item.addEventListener('mouseenter', function() {
+            window.isMouseOverMenu = true;
+            highlightGeometryBbox(featureIndex, childPath);
+            // Убираем подсветку со всех элементов меню
+            const allItems = infoDiv.querySelectorAll('.geometry-item[data-feature-index]');
+            allItems.forEach(otherItem => {
+                otherItem.style.background = '#f9f9f9';
+            });
+            // Подсвечиваем текущий элемент
+            item.style.background = '#e0f0ff';
+        });
+        
+        item.addEventListener('mouseleave', function() {
+            // Не убираем подсветку сразу, так как мышь может перейти на другой элемент меню
+            // или на карту
+        });
+    });
+}
+
 // Функция для анализа всех features и обновления панели информации
 function updateGeometryInfo(source) {
     const features = source.getFeatures();
     const analyses = [];
+    
+    // Сохраняем ссылку на features для использования в обработчиках
+    window.geometryInfoFeatures = features;
     
     // Проверяем доступность turf.js при первом вызове
     if (typeof window.turfChecked === 'undefined') {
@@ -827,9 +1164,17 @@ function updateGeometryInfo(source) {
         }
     });
     
+    // Сохраняем анализы для доступа к дочерним геометриям
+    window.geometryInfoAnalyses = analyses;
+    
     const infoDiv = document.getElementById('geometry-info');
     if (infoDiv) {
         infoDiv.innerHTML = renderGeometryInfo(analyses);
+        
+        // Устанавливаем обработчики событий после обновления HTML
+        setTimeout(function() {
+            setupGeometryInfoEventHandlers();
+        }, 10);
     }
 }
 
@@ -973,6 +1318,80 @@ function initPreviewMap(domElId, preview, previewSettings) {
             if (html)
                 popup.show(evt.mapBrowserEvent.coordinate, html);
         });
+        
+        // Создаем слой подсветки при инициализации карты
+        createHighlightLayer(map);
+        
+        // Добавляем обработчик для подсветки элементов меню при наведении на карту
+        let hoverInteraction = new ol.interaction.Select({
+            condition: ol.events.condition.pointerMove,
+            style: function() {
+                // Возвращаем null, чтобы не изменять стиль самих features
+                return null;
+            }
+        });
+        
+        hoverInteraction.on('select', function(evt) {
+            // Игнорируем события, если мышь над меню
+            if (window.isMouseOverMenu) {
+                return;
+            }
+            
+            const selectedFeatures = evt.selected;
+            const infoDiv = document.getElementById('geometry-info');
+            
+            if (!infoDiv || !window.geometryInfoFeatures) {
+                return;
+            }
+            
+            // Убираем подсветку со всех элементов меню
+            const allItems = infoDiv.querySelectorAll('.geometry-item[data-feature-index]');
+            allItems.forEach(item => {
+                item.style.background = '#f9f9f9';
+            });
+            
+            // Подсвечиваем соответствующий элемент меню
+            if (selectedFeatures.getLength() > 0) {
+                const hoveredFeature = selectedFeatures.item(0);
+                const featureIndex = window.geometryInfoFeatures.indexOf(hoveredFeature);
+                
+                if (featureIndex >= 0) {
+                    // Пытаемся найти дочерний элемент, над которым находится курсор
+                    const coordinate = evt.mapBrowserEvent.coordinate;
+                    const childPath = findChildPathByCoordinate(featureIndex, coordinate);
+                    
+                    // Формируем селектор для поиска элемента меню
+                    let menuItemSelector = `.geometry-item[data-feature-index="${featureIndex}"]`;
+                    if (childPath && childPath.length > 0) {
+                        // Ищем элемент с соответствующим путем к дочернему элементу
+                        const pathStr = childPath.join(',');
+                        menuItemSelector = `.geometry-item[data-feature-index="${featureIndex}"][data-child-path="${pathStr}"]`;
+                    }
+                    
+                    const menuItem = infoDiv.querySelector(menuItemSelector);
+                    if (menuItem) {
+                        menuItem.style.background = '#e0f0ff';
+                        // Прокручиваем к элементу, если он не виден
+                        menuItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    } else if (!childPath || childPath.length === 0) {
+                        // Если не нашли дочерний элемент, ищем корневой
+                        const rootMenuItem = infoDiv.querySelector(`.geometry-item[data-feature-index="${featureIndex}"]:not([data-child-path])`);
+                        if (rootMenuItem) {
+                            rootMenuItem.style.background = '#e0f0ff';
+                            rootMenuItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                        }
+                    }
+                    
+                    // Подсвечиваем bbox на карте (с учетом дочернего элемента, если есть)
+                    highlightGeometryBbox(featureIndex, childPath);
+                }
+            } else {
+                // Если курсор не над геометрией, убираем подсветку
+                clearGeometryHighlight();
+            }
+        });
+        
+        map.addInteraction(hoverInteraction);
         
         // Обновляем информацию о геометриях после инициализации карты
         setTimeout(function() {
