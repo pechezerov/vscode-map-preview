@@ -13,6 +13,8 @@ const SCHEME = "map-preview";
 const WEBVIEW_TYPE = "mapPreview";
 const PREVIEW_COMMAND_ID = "map.preview";
 const PREVIEW_PROJ_COMMAND_ID = "map.preview-with-proj";
+const CLOSE_POLYGONS_COMMAND_ID = "map.close-polygons";
+const SIMPLIFY_GEOMETRIES_COMMAND_ID = "map.simplify-geometries";
 
 interface IWebViewContext {
     asWebviewUri(src: vscode.Uri): vscode.Uri;
@@ -210,7 +212,7 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
         return `<body>
             <div id="map" style="width: 100%; height: 100%">
                 <div id="format" style="position: absolute; left: 40; top: 5; z-index: 100; padding: 5px; background: yellow; color: black"></div>
-                <div id="geometry-info" style="position: absolute; right: 10px; top: 10px; width: 350px; max-height: 80%; overflow-y: auto; z-index: 1000; background: rgba(255, 255, 255, 0.95); border: 1px solid #ccc; border-radius: 4px; padding: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); font-size: 12px;"></div>
+                <div id="geometry-info" style="position: absolute; right: 10px; top: 200px; width: 210px; max-height: 80%; overflow-y: auto; z-index: 1000; background: rgba(255, 255, 255, 0.95); border: 1px solid #ccc; border-radius: 4px; padding: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2); font-size: 12px;"></div>
             </div>
             <div id="loading-mask" style="position: absolute; top: 0; left: 0; right: 0; bottom: 0">
                 <div>Loading Preview ...</div>
@@ -224,7 +226,11 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
             this.createLocalSource("ol.js", SourceType.SCRIPT) +
             this.createLocalSource("ol-layerswitcher.js", SourceType.SCRIPT) +
             this.createLocalSource("ol-popup.js", SourceType.SCRIPT) +
-            this.createLocalSource("turf.min.js", SourceType.SCRIPT) +
+            this.createLocalSource("jsts.min.js", SourceType.SCRIPT) +
+            `<script nonce="${this._wctx.getScriptNonce()}" type="text/javascript">
+                // Инициализируем VS Code API в самом начале, до загрузки других скриптов
+                window.vscode = acquireVsCodeApi();
+            </script>` +
             this.createLocalSource("preview.js", SourceType.SCRIPT) +
             this.createLocalSource("preview.css", SourceType.STYLE) +
             `<script nonce="${this._wctx.getScriptNonce()}" type="text/javascript">
@@ -367,9 +373,7 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                     }
                 }
 
-                // Получаем VS Code API
-                const vscode = acquireVsCodeApi();
-                
+                // VS Code API уже инициализирован в начале скрипта
                 // Обработчик сообщений от расширения
                 window.addEventListener('message', event => {
                     const message = event.data;
@@ -380,12 +384,56 @@ class PreviewDocumentContentProvider implements vscode.TextDocumentContentProvid
                                 console.log('Received updatePreview command');
                                 loadPreview();
                                 break;
+                            case 'simplifyGeometries':
+                                // Упрощаем геометрии
+                                console.log('Received simplifyGeometries command');
+                                if (typeof simplifyGeoJSONGeometries === 'function' && typeof currentDocUri !== 'undefined') {
+                                    const docUri = currentDocUri;
+                                    fetch(docUri + (docUri.indexOf('?') === -1 ? '?' : '&') + '_t=' + Date.now(), { cache: 'no-cache' })
+                                        .then(r => {
+                                            if (!r.ok) {
+                                                throw new Error('HTTP error! status: ' + r.status);
+                                            }
+                                            return r.text();
+                                        })
+                                        .then(content => {
+                                            // Упрощаем GeoJSON
+                                            const simplified = simplifyGeoJSONGeometries(content);
+                                            
+                                            // Проверяем, были ли внесены изменения
+                                            if (simplified === content) {
+                                                window.vscode.postMessage({
+                                                    command: 'info',
+                                                    message: 'Геометрии уже упрощены или не требуют упрощения'
+                                                });
+                                            } else {
+                                                // Отправляем упрощенный контент в расширение
+                                                window.vscode.postMessage({
+                                                    command: 'simplifyGeometries',
+                                                    content: simplified
+                                                });
+                                            }
+                                        })
+                                        .catch(e => {
+                                            console.error('Error:', e);
+                                            window.vscode.postMessage({
+                                                command: 'error',
+                                                message: 'Ошибка при упрощении геометрий: ' + e.message
+                                            });
+                                        });
+                                } else {
+                                    window.vscode.postMessage({
+                                        command: 'error',
+                                        message: 'Функция упрощения геометрий недоступна'
+                                    });
+                                }
+                                break;
                         }
                     }
                 });
 
                 // Уведомляем расширение, что webview готов
-                vscode.postMessage({ command: 'ready' });
+                window.vscode.postMessage({ command: 'ready' });
 
                 // Загружаем предпросмотр при инициализации
                 loadPreview();
@@ -450,10 +498,88 @@ function loadWebView(content: PreviewDocumentContentProvider, previewUri: vscode
     
     // Обработчик сообщений от webview
     panel.webview.onDidReceiveMessage(
-        message => {
+        async message => {
             switch (message.command) {
                 case 'ready':
                     // Webview готов, можно отправлять обновления
+                    break;
+                case 'normalizeGeometries':
+                    // Получаем нормализованный контент от webview
+                    const normalizedContent = message.content;
+                    if (normalizedContent) {
+                        try {
+                            // Находим соответствующий документ
+                            const docUriString = doc.uri.toString();
+                            const textEditor = vscode.window.visibleTextEditors.find(ed => 
+                                ed.document.uri.toString() === docUriString
+                            );
+                            
+                            if (textEditor) {
+                                // Обновляем документ
+                                const edit = new vscode.WorkspaceEdit();
+                                const fullRange = new vscode.Range(
+                                    textEditor.document.positionAt(0),
+                                    textEditor.document.positionAt(textEditor.document.getText().length)
+                                );
+                                edit.replace(textEditor.document.uri, fullRange, normalizedContent);
+                                
+                                const applied = await vscode.workspace.applyEdit(edit);
+                                if (applied) {
+                                    // Сохраняем документ
+                                    await textEditor.document.save();
+                                    vscode.window.showInformationMessage('Незамкнутые контуры успешно исправлены');
+                                } else {
+                                    vscode.window.showErrorMessage('Не удалось применить изменения');
+                                }
+                            } else {
+                                vscode.window.showErrorMessage('Документ не найден в открытых редакторах');
+                            }
+                        } catch (error) {
+                            vscode.window.showErrorMessage('Ошибка при нормализации геометрий: ' + error.message);
+                        }
+                    }
+                    break;
+                case 'simplifyGeometries':
+                    // Получаем упрощенный контент от webview
+                    const simplifiedContent = message.content;
+                    if (simplifiedContent) {
+                        try {
+                            // Находим соответствующий документ
+                            const docUriString = doc.uri.toString();
+                            const textEditor = vscode.window.visibleTextEditors.find(ed => 
+                                ed.document.uri.toString() === docUriString
+                            );
+                            
+                            if (textEditor) {
+                                // Обновляем документ
+                                const edit = new vscode.WorkspaceEdit();
+                                const fullRange = new vscode.Range(
+                                    textEditor.document.positionAt(0),
+                                    textEditor.document.positionAt(textEditor.document.getText().length)
+                                );
+                                edit.replace(textEditor.document.uri, fullRange, simplifiedContent);
+                                
+                                const applied = await vscode.workspace.applyEdit(edit);
+                                if (applied) {
+                                    // Сохраняем документ
+                                    await textEditor.document.save();
+                                    vscode.window.showInformationMessage('Геометрии успешно упрощены');
+                                } else {
+                                    vscode.window.showErrorMessage('Не удалось применить изменения');
+                                }
+                            } else {
+                                vscode.window.showErrorMessage('Документ не найден в открытых редакторах');
+                            }
+                        } catch (error) {
+                            vscode.window.showErrorMessage('Ошибка при упрощении геометрий: ' + error.message);
+                        }
+                    }
+                    break;
+                case 'error':
+                    vscode.window.showErrorMessage(message.message || 'Произошла ошибка');
+                    break;
+                case 'info':
+                    vscode.window.showInformationMessage(message.message || 'Информация');
                     break;
             }
         },
@@ -473,6 +599,207 @@ function getNonce() {
 
 interface ProjectionItem extends vscode.QuickPickItem {
     projection: string;
+}
+
+interface NormalizeResult {
+    geom: any;
+    modified: boolean;
+}
+
+// Функция для нормализации незамкнутых контуров в GeoJSON
+function normalizeGeoJSONGeometries(geoJSON: string): string {
+    try {
+        const parsed = JSON.parse(geoJSON);
+        let modified = false;
+        
+        function closeRing(ring: number[][]): { ring: number[][]; modified: boolean } {
+            // Создаем копию массива
+            const ringCopy = ring.map(coord => [coord[0], coord[1]]);
+            
+            // Минимум 2 точки нужно для контура
+            if (ringCopy.length < 2) {
+                return { ring: ringCopy, modified: false }; // Недостаточно точек для контура
+            }
+            
+            const first = ringCopy[0];
+            const last = ringCopy[ringCopy.length - 1];
+            
+            // Проверяем, замкнут ли контур (с небольшой погрешностью для числовых ошибок)
+            const tolerance = 1e-10;
+            const isClosed = Math.abs(first[0] - last[0]) < tolerance && 
+                           Math.abs(first[1] - last[1]) < tolerance;
+            
+            if (!isClosed) {
+                // Добавляем первую точку в конец для замыкания контура
+                ringCopy.push([first[0], first[1]]);
+                return { ring: ringCopy, modified: true };
+            }
+            
+            return { ring: ringCopy, modified: false };
+        }
+        
+        function normalizeGeometry(geom: any): NormalizeResult {
+            if (!geom) {
+                return { geom: geom, modified: false };
+            }
+            
+            // Если объект имеет geometry, но не имеет type (не Feature), обрабатываем geometry
+            if (!geom.type && geom.geometry) {
+                let localModified = false;
+                let result = JSON.parse(JSON.stringify(geom)); // Глубокая копия
+                const normalized = normalizeGeometry(result.geometry);
+                result.geometry = normalized.geom;
+                if (normalized.modified) {
+                    localModified = true;
+                }
+                return { geom: result, modified: localModified };
+            }
+            
+            // Если нет type, возвращаем без изменений
+            if (!geom.type) {
+                return { geom: geom, modified: false };
+            }
+            
+            let localModified = false;
+            let result = JSON.parse(JSON.stringify(geom)); // Глубокая копия
+            
+            switch (result.type) {
+                case 'Polygon':
+                    // Применяем изменения только к массивам coordinates внутри Polygon
+                    if (result.coordinates && Array.isArray(result.coordinates)) {
+                        const closedRings = result.coordinates.map((ring: number[][]) => {
+                            const closed = closeRing(ring);
+                            if (closed.modified) {
+                                localModified = true;
+                            }
+                            return closed.ring;
+                        });
+                        result.coordinates = closedRings;
+                    }
+                    break;
+                    
+                case 'MultiPolygon':
+                    // Применяем изменения только к массивам coordinates внутри MultiPolygon
+                    if (result.coordinates && Array.isArray(result.coordinates)) {
+                        const closedPolygons = result.coordinates.map((polygon: number[][][]) => {
+                            return polygon.map((ring: number[][]) => {
+                                const closed = closeRing(ring);
+                                if (closed.modified) {
+                                    localModified = true;
+                                }
+                                return closed.ring;
+                            });
+                        });
+                        result.coordinates = closedPolygons;
+                    }
+                    break;
+                    
+                case 'Feature':
+                    // Если это Feature, обрабатываем только его geometry (рекурсивно)
+                    if (result.geometry) {
+                        const normalized = normalizeGeometry(result.geometry);
+                        result.geometry = normalized.geom;
+                        if (normalized.modified) {
+                            localModified = true;
+                        }
+                    }
+                    break;
+                    
+                case 'FeatureCollection':
+                    // Если это FeatureCollection, обрабатываем только features (рекурсивно)
+                    if (result.features && Array.isArray(result.features)) {
+                        result.features = result.features.map((feature: any) => {
+                            const normalized = normalizeGeometry(feature);
+                            if (normalized.modified) {
+                                localModified = true;
+                            }
+                            return normalized.geom;
+                        });
+                    }
+                    break;
+                    
+                default:
+                    // Для всех остальных типов геометрий (Point, LineString, MultiPoint, MultiLineString и т.д.)
+                    // возвращаем без изменений
+                    return { geom: result, modified: false };
+            }
+            
+            return { geom: result, modified: localModified };
+        }
+        
+        // Обрабатываем разные типы входных данных
+        let result: any;
+        const isArray = Array.isArray(parsed);
+        
+        // Если это массив
+        if (isArray && parsed.length > 0) {
+            const firstItem = parsed[0];
+            if (firstItem && typeof firstItem === 'object') {
+                // Проверяем, является ли это массивом features (имеет свойство geometry)
+                if (firstItem.geometry) {
+                    // Обрабатываем каждый feature в массиве
+                    result = parsed.map((item: any) => {
+                        const normalized = normalizeGeometry(item);
+                        if (normalized.modified) {
+                            modified = true;
+                        }
+                        return normalized.geom;
+                    });
+                } 
+                // Проверяем, является ли это массивом геометрий (имеет type)
+                else if (firstItem.type) {
+                    // Обрабатываем каждую геометрию в массиве
+                    result = parsed.map((item: any) => {
+                        const normalized = normalizeGeometry(item);
+                        if (normalized.modified) {
+                            modified = true;
+                        }
+                        return normalized.geom;
+                    });
+                } else {
+                    // Неизвестный формат массива, возвращаем как есть
+                    return geoJSON;
+                }
+            } else {
+                // Не массив объектов, возвращаем как есть
+                return geoJSON;
+            }
+        } else {
+            // Обрабатываем как единый объект (Feature, FeatureCollection, Geometry)
+            const normalized = normalizeGeometry(parsed);
+            result = normalized.geom;
+            if (normalized.modified) {
+                modified = true;
+            }
+        }
+        
+        if (modified) {
+            // Убеждаемся, что структура сохранилась (массив остался массивом, объект остался объектом)
+            if (isArray && !Array.isArray(result)) {
+                // Это не должно произойти, но на всякий случай возвращаем исходный файл
+                console.error('Structure mismatch: input was array but result is not');
+                return geoJSON;
+            }
+            if (!isArray && Array.isArray(result)) {
+                // Это не должно произойти, но на всякий случай возвращаем исходный файл
+                console.error('Structure mismatch: input was not array but result is array');
+                return geoJSON;
+            }
+            // Дополнительная проверка: убеждаемся, что массив остался массивом
+            const resultString = JSON.stringify(result, null, 2);
+            const reparsed = JSON.parse(resultString);
+            if (isArray && !Array.isArray(reparsed)) {
+                console.error('Structure lost after stringify: input was array but reparsed is not');
+                return geoJSON;
+            }
+            return resultString;
+        }
+        
+        return geoJSON;
+    } catch (e: any) {
+        console.error('Error normalizing GeoJSON:', e);
+        return geoJSON;
+    }
 }
 
 // this method is called when your extension is activated
@@ -537,11 +864,74 @@ export function activate(context: vscode.ExtensionContext) {
         });
     });
 
+    const closePolygonsCommand = vscode.commands.registerCommand(CLOSE_POLYGONS_COMMAND_ID, async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showErrorMessage("Нет открытого редактора");
+            return;
+        }
+        
+        const doc = editor.document;
+        const fileName = doc.fileName.toLowerCase();
+        
+        // Проверяем, что это GeoJSON файл
+        if (!fileName.endsWith('.geojson') && !fileName.endsWith('.json')) {
+            vscode.window.showWarningMessage("Команда работает только с GeoJSON файлами (.geojson, .json)");
+            return;
+        }
+        
+        try {
+            const content = doc.getText();
+            
+            // Нормализуем GeoJSON
+            const normalized = normalizeGeoJSONGeometries(content);
+            
+            // Проверяем, были ли внесены изменения
+            // Сравниваем нормализованные JSON для учета различий в форматировании
+            try {
+                const originalParsed = JSON.parse(content);
+                const normalizedParsed = JSON.parse(normalized);
+                const originalString = JSON.stringify(originalParsed);
+                const normalizedString = JSON.stringify(normalizedParsed);
+                
+                if (originalString === normalizedString) {
+                    vscode.window.showInformationMessage("Незамкнутые контуры не найдены");
+                    return;
+                }
+            } catch (e) {
+                // Если не удалось распарсить, сравниваем как строки
+                if (normalized === content) {
+                    vscode.window.showInformationMessage("Незамкнутые контуры не найдены");
+                    return;
+                }
+            }
+            
+            // Обновляем документ
+            const edit = new vscode.WorkspaceEdit();
+            const fullRange = new vscode.Range(
+                doc.positionAt(0),
+                doc.positionAt(content.length)
+            );
+            edit.replace(doc.uri, fullRange, normalized);
+            
+            const applied = await vscode.workspace.applyEdit(edit);
+            if (applied) {
+                // Сохраняем документ
+                await doc.save();
+                vscode.window.showInformationMessage("Полигоны успешно замкнуты");
+            } else {
+                vscode.window.showErrorMessage("Не удалось применить изменения");
+            }
+        } catch (error: any) {
+            vscode.window.showErrorMessage("Ошибка при замыкании полигонов: " + error.message);
+        }
+    });
+
     // Подписка на изменения документов для live preview
     const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
         // Игнорируем изменения в негеопространственных файлах
         const fileName = e.document.fileName.toLowerCase();
-        const supportedExtensions = ['.geojson', '.json', '.kml', '.csv', '.gpx', '.igc', '.gml'];
+        const supportedExtensions = ['.geojson', '.json', '.kml', '.csv', '.gpx', '.igc', '.gml', '.txt'];
         const isSupported = supportedExtensions.some(ext => fileName.endsWith(ext));
         
         if (!isSupported) {
@@ -563,7 +953,47 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    context.subscriptions.push(previewCommand, previewWithProjCommand, registration, changeDocumentSubscription);
+    const simplifyGeometriesCommand = vscode.commands.registerCommand(SIMPLIFY_GEOMETRIES_COMMAND_ID, async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showErrorMessage("Нет открытого редактора");
+            return;
+        }
+        
+        const doc = editor.document;
+        const fileName = doc.fileName.toLowerCase();
+        
+        // Проверяем, что это GeoJSON файл
+        if (!fileName.endsWith('.geojson') && !fileName.endsWith('.json')) {
+            vscode.window.showWarningMessage("Команда работает только с GeoJSON файлами (.geojson, .json)");
+            return;
+        }
+        
+        try {
+            const content = doc.getText();
+            
+            // Упрощаем GeoJSON (округляем координаты до тысячных и удаляем дубликаты)
+            // Используем функцию из preview.js через webview, если он открыт
+            const docUriString = doc.uri.toString();
+            const panel = previewPanels.get(docUriString);
+            
+            if (panel) {
+                // Если панель предпросмотра открыта, отправляем сообщение в webview
+                panel.webview.postMessage({
+                    command: 'simplifyGeometries'
+                });
+            } else {
+                // Если панель не открыта, используем функцию напрямую из extension
+                // Но функция simplifyGeoJSONGeometries находится в preview.js, поэтому
+                // нужно либо дублировать логику, либо открыть панель предпросмотра
+                vscode.window.showWarningMessage("Откройте предпросмотр карты для использования этой функции");
+            }
+        } catch (error) {
+            vscode.window.showErrorMessage('Ошибка при упрощении геометрий: ' + error.message);
+        }
+    });
+
+    context.subscriptions.push(previewCommand, previewWithProjCommand, closePolygonsCommand, simplifyGeometriesCommand, registration, changeDocumentSubscription);
 }
 
 // this method is called when your extension is deactivated

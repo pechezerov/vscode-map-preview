@@ -2,7 +2,7 @@
     "name": "vscode-map-preview",
     "displayName": "VSCode Map Preview",
     "description": "VSCode extension for visually previewing geospatial file content (GeoJSON, KML, etc) on a map",
-    "version": "0.7.2",
+    "version": "0.8.0",
     "private": true,
     "publisher": "jumpinjackie",
     "engines": {
@@ -28,7 +28,8 @@
     ],
     "activationEvents": [
         "onCommand:map.preview",
-        "onCommand:map.preview-with-proj"
+        "onCommand:map.preview-with-proj",
+        "onCommand:map.close-polygons"
     ],
     "main": "./out/src/extension",
     "contributes": {
@@ -37,12 +38,12 @@
                 {
                     "command": "map.preview",
                     "group": "navigation",
-                    "when": "resourceExtname == .geojson || resourceExtname == .json || resourceExtname == .kml || resourceExtname == .csv || resourceExtname == .gpx || resourceExtname == .igc || resourceExtname == .gml"
+                    "when": "resourceExtname == .geojson || resourceExtname == .json || resourceExtname == .kml || resourceExtname == .csv || resourceExtname == .gpx || resourceExtname == .igc || resourceExtname == .gml || resourceExtname == .txt"
                 },
                 {
                     "command": "map.preview-with-proj",
                     "group": "navigation",
-                    "when": "resourceExtname == .geojson || resourceExtname == .json || resourceExtname == .kml || resourceExtname == .csv || resourceExtname == .gpx || resourceExtname == .igc || resourceExtname == .gml"
+                    "when": "resourceExtname == .geojson || resourceExtname == .json || resourceExtname == .kml || resourceExtname == .csv || resourceExtname == .gpx || resourceExtname == .igc || resourceExtname == .gml || resourceExtname == .txt"
                 }
             ]
         },
@@ -334,6 +335,14 @@
                     "light": "./static/icons/map-proj-light.svg",
                     "dark": "./static/icons/map-proj-dark.svg"
                 }
+            },
+            {
+                "command": "map.close-polygons",
+                "title": "Замкнуть полигоны"
+            },
+            {
+                "command": "map.simplify-geometries",
+                "title": "Упростить геометрии"
             }
         ],
         "keybindings": [
